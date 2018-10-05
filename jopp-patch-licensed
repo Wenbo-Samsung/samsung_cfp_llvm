@@ -1,0 +1,72 @@
+diff --git a/lib/Target/AArch64/AArch64AsmPrinter.cpp b/lib/Target/AArch64/AArch64AsmPrinter.cpp
+index b7129bf56b7..c92e54ca49d 100644
+--- a/lib/Target/AArch64/AArch64AsmPrinter.cpp
++++ b/lib/Target/AArch64/AArch64AsmPrinter.cpp
+@@ -124,6 +124,8 @@ private:
+ 
+   void PrintDebugValueComment(const MachineInstr *MI, raw_ostream &OS);
+ 
++  void EmitFunctionEntryLabel() override;
++
+   void EmitFunctionBodyEnd() override;
+ 
+   MCSymbol *GetCPISymbol(unsigned CPID) const override;
+@@ -250,6 +252,26 @@ void AArch64AsmPrinter::EmitLOHs() {
+   }
+ }
+ 
++void AArch64AsmPrinter::EmitFunctionEntryLabel() {
++  // Emit NOP
++  MCInst Nop;
++  Nop.setOpcode(AArch64::NOP);
++  OutStreamer->EmitInstruction(Nop, getSubtargetInfo());
++  
++  CurrentFnSym->redefineIfPossible();
++
++  // The function label could have already been emitted if two symbols end up
++  // conflicting due to asm renaming.  Detect this and emit an error.
++  if (CurrentFnSym->isVariable())
++    report_fatal_error("'" + Twine(CurrentFnSym->getName()) +
++                       "' is a protected alias");
++  if (CurrentFnSym->isDefined())
++    report_fatal_error("'" + Twine(CurrentFnSym->getName()) +
++                       "' label emitted multiple times to assembly file");
++
++  return OutStreamer->EmitLabel(CurrentFnSym);
++}
++
+ void AArch64AsmPrinter::EmitFunctionBodyEnd() {
+   if (!AArch64FI->getLOHRelated().empty())
+     EmitLOHs();
+diff --git a/lib/Target/AArch64/AArch64InstrFormats.td b/lib/Target/AArch64/AArch64InstrFormats.td
+index 1946d5a14dc..ac119e04337 100644
+--- a/lib/Target/AArch64/AArch64InstrFormats.td
++++ b/lib/Target/AArch64/AArch64InstrFormats.td
+@@ -903,6 +903,14 @@ let mayStore = 1, mayLoad = 1, hasSideEffects = 1 in
+     let Inst{11-5} = imm;
+   }
+ 
++let mayStore = 1, mayLoad = 1, hasSideEffects = 1 in
++  class NOPI<string mnemonic>
++      : SimpleSystemI<0, (ins), mnemonic, "",[]>,
++        Sched<[WriteBarrier]> {
++    let Inst{20-12} = 0b000110010;
++    let Inst{11-5} = 0b0000000;
++  }
++
+ // System instructions taking a single literal operand which encodes into
+ // CRm. op2 differentiates the opcodes.
+ def BarrierAsmOperand : AsmOperandClass {
+diff --git a/lib/Target/AArch64/AArch64InstrInfo.td b/lib/Target/AArch64/AArch64InstrInfo.td
+index cb562026997..cb40d1cb55c 100644
+--- a/lib/Target/AArch64/AArch64InstrInfo.td
++++ b/lib/Target/AArch64/AArch64InstrInfo.td
+@@ -420,6 +420,8 @@ def : InstAlias<"sev",  (HINT 0b100)>;
+ def : InstAlias<"sevl", (HINT 0b101)>;
+ def : InstAlias<"esb",  (HINT 0b10000)>, Requires<[HasRAS]>;
+ 
++def NOP : NOPI<"nop">;
++
+ // v8.2a Statistical Profiling extension
+ def : InstAlias<"psb $op",  (HINT psbhint_op:$op)>, Requires<[HasSPE]>;
+ 

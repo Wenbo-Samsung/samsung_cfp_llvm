@@ -1,0 +1,266 @@
+diff --git a/lib/Target/AArch64/AArch64.h b/lib/Target/AArch64/AArch64.h
+index edda13ce97e..b3078d2912b 100644
+--- a/lib/Target/AArch64/AArch64.h
++++ b/lib/Target/AArch64/AArch64.h
+@@ -54,6 +54,8 @@ InstructionSelector *
+ createAArch64InstructionSelector(const AArch64TargetMachine &,
+                                  AArch64Subtarget &, AArch64RegisterBankInfo &);
+ 
++FunctionPass *createNoplizePass();
++
+ void initializeAArch64A53Fix835769Pass(PassRegistry&);
+ void initializeAArch64A57FPLoadBalancingPass(PassRegistry&);
+ void initializeAArch64AdvSIMDScalarPass(PassRegistry&);
+@@ -71,6 +73,7 @@ void initializeAArch64StorePairSuppressPass(PassRegistry&);
+ void initializeFalkorHWPFFixPass(PassRegistry&);
+ void initializeFalkorMarkStridedAccessesLegacyPass(PassRegistry&);
+ void initializeLDTLSCleanupPass(PassRegistry&);
++void initializeAArch64NoplizePass(PassRegistry&);
+ } // end namespace llvm
+ 
+ #endif
+diff --git a/lib/Target/AArch64/AArch64AsmPrinter.cpp b/lib/Target/AArch64/AArch64AsmPrinter.cpp
+index 2ff2ee347f5..fbe21544155 100644
+--- a/lib/Target/AArch64/AArch64AsmPrinter.cpp
++++ b/lib/Target/AArch64/AArch64AsmPrinter.cpp
+@@ -124,6 +124,8 @@ private:
+ 
+   void PrintDebugValueComment(const MachineInstr *MI, raw_ostream &OS);
+ 
++  void EmitFunctionEntryLabel() override;
++
+   void EmitFunctionBodyEnd() override;
+ 
+   MCSymbol *GetCPISymbol(unsigned CPID) const override;
+@@ -250,6 +252,26 @@ void AArch64AsmPrinter::EmitLOHs() {
+   }
+ }
+ 
++void AArch64AsmPrinter::EmitFunctionEntryLabel() {
++  // Emit NOP
++  MCInst Nop;
++  Nop.setOpcode(AArch64::NOP);
++  OutStreamer->EmitInstruction(Nop, getSubtargetInfo());
++  
++  CurrentFnSym->redefineIfPossible();
++
++  // The function label could have already been emitted if two symbols end up
++  // conflicting due to asm renaming.  Detect this and emit an error.
++  if (CurrentFnSym->isVariable())
++    report_fatal_error("'" + Twine(CurrentFnSym->getName()) +
++                       "' is a protected alias");
++  if (CurrentFnSym->isDefined())
++    report_fatal_error("'" + Twine(CurrentFnSym->getName()) +
++                       "' label emitted multiple times to assembly file");
++
++  return OutStreamer->EmitLabel(CurrentFnSym);
++}
++
+ void AArch64AsmPrinter::EmitFunctionBodyEnd() {
+   if (!AArch64FI->getLOHRelated().empty())
+     EmitLOHs();
+diff --git a/lib/Target/AArch64/AArch64InstrFormats.td b/lib/Target/AArch64/AArch64InstrFormats.td
+index 80c5092a4ee..66824088731 100644
+--- a/lib/Target/AArch64/AArch64InstrFormats.td
++++ b/lib/Target/AArch64/AArch64InstrFormats.td
+@@ -903,6 +903,14 @@ let mayStore = 1, mayLoad = 1, hasSideEffects = 1 in
+     let Inst{11-5} = imm;
+   }
+ 
++let mayStore = 1, mayLoad = 1, hasSideEffects = 1 in
++  class NOPI<string mnemonic>
++      : SimpleSystemI<0, (ins), mnemonic, "",[]>,
++        Sched<[WriteBarrier]> {
++    let Inst{20-12} = 0b000110010;
++    let Inst{11-5} = 0b0000000;
++  }
++
+ // System instructions taking a single literal operand which encodes into
+ // CRm. op2 differentiates the opcodes.
+ def BarrierAsmOperand : AsmOperandClass {
+diff --git a/lib/Target/AArch64/AArch64InstrInfo.td b/lib/Target/AArch64/AArch64InstrInfo.td
+index 79826ca2ed8..daaaaae2ac5 100644
+--- a/lib/Target/AArch64/AArch64InstrInfo.td
++++ b/lib/Target/AArch64/AArch64InstrInfo.td
+@@ -421,6 +421,8 @@ def : InstAlias<"sev",  (HINT 0b100)>;
+ def : InstAlias<"sevl", (HINT 0b101)>;
+ def : InstAlias<"esb",  (HINT 0b10000)>, Requires<[HasRAS]>;
+ 
++def NOP : NOPI<"nop">;
++
+ // v8.2a Statistical Profiling extension
+ def : InstAlias<"psb $op",  (HINT psbhint_op:$op)>, Requires<[HasSPE]>;
+ 
+diff --git a/lib/Target/AArch64/AArch64Noplize.cpp b/lib/Target/AArch64/AArch64Noplize.cpp
+new file mode 100644
+index 00000000000..5e8cb9abfae
+--- /dev/null
++++ b/lib/Target/AArch64/AArch64Noplize.cpp
+@@ -0,0 +1,112 @@
++//===- AArch64Noplize.cpp -AArch64 Prologue and Epilogue NOP Insertion ----===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains the AArch64 implementation of inserting two nops in 
++// prologue and epilogue.
++//
++//===----------------------------------------------------------------------===//
++
++#include "AArch64.h"
++#include "AArch64InstrInfo.h"
++#include "AArch64MachineFunctionInfo.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineInstr.h"
++#include "llvm/CodeGen/MachineInstrBuilder.h"
++#include "llvm/CodeGen/MachineOperand.h"
++#include "llvm/CodeGen/TargetRegisterInfo.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/raw_ostream.h"
++#include "llvm/Target/TargetMachine.h"
++#include "llvm/CodeGen/TargetInstrInfo.h"
++#include "llvm/CodeGen/TargetSubtargetInfo.h"
++
++
++using namespace llvm;
++
++#define DEBUG_TYPE "aarch64-noplize"
++
++namespace {
++
++class AArch64Noplize : public MachineFunctionPass {
++public:
++  static char ID; // Pass identification, replacement for typeid.
++  explicit AArch64Noplize() : MachineFunctionPass(ID) {
++    initializeAArch64NoplizePass(*PassRegistry::getPassRegistry());
++  }
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  StringRef getPassName() const override { return "NOPLIZE"; }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.setPreservesCFG();
++    MachineFunctionPass::getAnalysisUsage(AU);
++  }
++};
++
++char AArch64Noplize::ID = 0;
++
++}
++
++INITIALIZE_PASS(AArch64Noplize, "aarch64-noplize",
++                 "AARCH64 NOPLIZE", false, false)
++
++bool AArch64Noplize::runOnMachineFunction(MachineFunction &MF)
++{
++    const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
++    for (MachineBasicBlock &MBB: MF)
++    for (auto MBBI = MBB.begin(); MBBI!= MBB.end(); ++MBBI)
++    {
++        if (MBBI->getFlag(MachineInstr::FrameSetup))
++        {
++            if (!((MBBI->getOpcode()==AArch64::STPXi)
++                ||(MBBI->getOpcode()==AArch64::STPDi)//frame store pair
++                ||(MBBI->getOpcode()==AArch64::STPXpre)
++                ||(MBBI->getOpcode()==AArch64::STPDpre)//+early clobber for tail-call optimization
++                ||(MBBI->getOpcode()==AArch64::STPXpost)
++                ||(MBBI->getOpcode()==AArch64::STPDpost)))
++                continue;
++            if ((MBBI->getOperand(1).getReg()==AArch64::LR) ||
++                (MBBI->getOperand(2).getReg()==AArch64::LR))
++            {
++                DebugLoc DL = MBB.findDebugLoc(MBBI);
++                BuildMI(MBB, MBBI, DL, TII.get(AArch64::NOP))
++                    .setMIFlag(MachineInstr::FrameSetup);
++                MIBundleBuilder(MBB, std::prev(MBBI,1), MBBI);
++            }
++        }else if (MBBI->getFlag(MachineInstr::FrameDestroy))
++        {
++            //put your code here
++            if (!((MBBI->getOpcode()==AArch64::LDPXi)
++                ||(MBBI->getOpcode()==AArch64::LDPDi)//frame store pair
++                ||(MBBI->getOpcode()==AArch64::LDPXpre)
++                ||(MBBI->getOpcode()==AArch64::LDPDpre)//+early clobber for tail-call optimization
++                ||(MBBI->getOpcode()==AArch64::LDPSWpre)
++                ||(MBBI->getOpcode()==AArch64::LDPXpost)
++                ||(MBBI->getOpcode()==AArch64::LDPDpost)
++                ||(MBBI->getOpcode()==AArch64::LDPSWpost)))
++                continue;
++            if ((MBBI->getOperand(1).getReg()==AArch64::LR) ||
++                (MBBI->getOperand(2).getReg()==AArch64::LR))
++            {
++                DebugLoc DL = MBB.findDebugLoc(MBBI);
++                BuildMI(MBB, std::next(MBBI,1), DL, TII.get(AArch64::NOP))
++                    .setMIFlag(MachineInstr::FrameDestroy);
++                MIBundleBuilder(MBB, MBBI, std::next(MBBI,1));
++            }
++        }
++    }
++    return true;
++}
++
++FunctionPass *llvm::createNoplizePass() {
++  return new AArch64Noplize();
++}
+diff --git a/lib/Target/AArch64/AArch64RegisterInfo.cpp b/lib/Target/AArch64/AArch64RegisterInfo.cpp
+index 88dd297e007..cdfaed7b753 100644
+--- a/lib/Target/AArch64/AArch64RegisterInfo.cpp
++++ b/lib/Target/AArch64/AArch64RegisterInfo.cpp
+@@ -122,6 +122,8 @@ AArch64RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
+   BitVector Reserved(getNumRegs());
+   markSuperRegs(Reserved, AArch64::WSP);
+   markSuperRegs(Reserved, AArch64::WZR);
++  markSuperRegs(Reserved, AArch64::W16);
++  markSuperRegs(Reserved, AArch64::W17);
+ 
+   if (TFI->hasFP(MF) || TT.isOSDarwin())
+     markSuperRegs(Reserved, AArch64::W29);
+@@ -147,6 +149,10 @@ bool AArch64RegisterInfo::isReservedReg(const MachineFunction &MF,
+   case AArch64::XZR:
+   case AArch64::WSP:
+   case AArch64::WZR:
++  case AArch64::X16:
++  case AArch64::W16:
++  case AArch64::X17:
++  case AArch64::W17:
+     return true;
+   case AArch64::X18:
+   case AArch64::W18:
+diff --git a/lib/Target/AArch64/AArch64TargetMachine.cpp b/lib/Target/AArch64/AArch64TargetMachine.cpp
+index 5d00dc58a5a..d1a7df79b12 100644
+--- a/lib/Target/AArch64/AArch64TargetMachine.cpp
++++ b/lib/Target/AArch64/AArch64TargetMachine.cpp
+@@ -164,6 +164,7 @@ extern "C" void LLVMInitializeAArch64Target() {
+   initializeFalkorHWPFFixPass(*PR);
+   initializeFalkorMarkStridedAccessesLegacyPass(*PR);
+   initializeLDTLSCleanupPass(*PR);
++  initializeAArch64NoplizePass(*PR);
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -523,4 +524,6 @@ void AArch64PassConfig::addPreEmitPass() {
+   if (TM->getOptLevel() != CodeGenOpt::None && EnableCollectLOH &&
+       TM->getTargetTriple().isOSBinFormatMachO())
+     addPass(createAArch64CollectLOHPass());
++
++  addPass(createNoplizePass());
+ }
+diff --git a/lib/Target/AArch64/CMakeLists.txt b/lib/Target/AArch64/CMakeLists.txt
+index 3d4b9dcf7e8..53575bf5d38 100644
+--- a/lib/Target/AArch64/CMakeLists.txt
++++ b/lib/Target/AArch64/CMakeLists.txt
+@@ -54,6 +54,7 @@ add_llvm_target(AArch64CodeGen
+   AArch64TargetObjectFile.cpp
+   AArch64TargetTransformInfo.cpp
+   AArch64SIMDInstrOpt.cpp
++  AArch64Noplize.cpp
+ 
+   DEPENDS
+   intrinsics_gen
