@@ -11,3 +11,8 @@ Clang	: 6387c4574ec668f75713af89c72cb8f37d8e3469
 `jopp-patch-licensed` contains the patch for the feature JOPP.
 
 `cfp-patch-licensed` contains the patch for both JOPP and ROPP.
+
+
+### License
+These patches are under the University of Illinois Open Source License.  
+See https://github.com/llvm-mirror/llvm/blob/master/LICENSE.TXT for details.
